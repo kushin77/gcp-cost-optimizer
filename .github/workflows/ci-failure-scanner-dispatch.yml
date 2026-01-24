@@ -1,0 +1,56 @@
+name: CI Failure Scanner (Manual Dispatch)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Specific PR to check (optional)'
+        required: false
+        type: number
+
+permissions:
+  issues: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  manual-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y jq
+
+      - name: Run CI failure scanner (manual)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.pr_number || '' }}" ]; then
+            echo "PR specified: ${{ github.event.inputs.pr_number }}"
+            PR_LIST="[${{ github.event.inputs.pr_number }}]"
+          else
+            PR_LIST=$(gh pr list --state open --limit 50 --json number,statusCheckRollup --jq '[.[] | select(.statusCheckRollup | any(.conclusion == "FAILURE")) | .number] | @json')
+          fi
+          echo "Found PRs: ${PR_LIST}"
+          PRS=$(echo "${PR_LIST}" | jq -r '.[]')
+          for PR in $PRS; do
+            PR_INFO=$(gh pr view "$PR" --json number,title,author,headRefName,statusCheckRollup,createdAt --jq '.')
+            TITLE=$(echo "$PR_INFO" | jq -r '.title')
+            AUTHOR=$(echo "$PR_INFO" | jq -r '.author.login')
+            BRANCH=$(echo "$PR_INFO" | jq -r '.headRefName')
+            FAILED_CHECKS=$(echo "$PR_INFO" | jq -r '.statusCheckRollup | map(select(.conclusion == "FAILURE") | .name) | join("\n• ")')
+            FAILED_COUNT=$(echo "$FAILED_CHECKS" | grep -c . || true)
+            ISSUE_TITLE="🚨 CI Failure on PR #$PR: $TITLE"
+            ISSUE_BODY="## CI Failure Alert\n**PR**: [#$PR](${GITHUB_SERVER_URL}/${{ github.repository }}/pull/$PR)\n**PR Title**: $TITLE\n**Author**: @$AUTHOR\n**Branch**: \\`$BRANCH\\`\n**Failed Checks**: $FAILED_COUNT\n\n### Failed CI Checks\n\n\`\`\`\n$FAILED_CHECKS\n\`\`\`\n\n### Next Steps\n1. Review the PR checks\n2. Fix issues and push changes\n\n---\n*Auto-created by manual dispatch*"
+            EXISTING=$(gh issue list --state all --limit 500 --json number,body --jq ".[] | select(.body | contains(\"PR #$PR\")) | .number" | head -1)
+            if [ -z "$EXISTING" ]; then
+              gh issue create --title "$ISSUE_TITLE" --body "$ISSUE_BODY" --label "ci-failure,automated,bug" --assignee "$AUTHOR"
+              echo "Created issue for PR $PR"
+            else
+              echo "Issue already exists for PR $PR (#$EXISTING)"
+            fi
+          done
